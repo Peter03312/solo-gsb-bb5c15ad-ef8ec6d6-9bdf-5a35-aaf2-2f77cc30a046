@@ -97,6 +97,37 @@
   指定在锁内复查到该账号已停用而按上述既有错误拒绝回滚，并发业务写持有的
   旧密钥复核失败按既有 401 回滚；业务写先提交则新增角色可能构成义务，停用
   随后在同一串行顺序下被拒绝；不存在“停用后新增角色”或部分停用。
+- 当前指定见证人对封存资料的所见摘要或本人参与记录存疑时，可在**开封前**
+  凭现有密钥提交资料编号、所见摘要与非空理由提出**异议**（POST
+  /documents/{id}/objections）：取得异议编号与 pending 状态；仅当前指定
+  见证人本人可提出，同一资料同时至多一件未决异议（部分唯一索引兜底并发）。
+  摘要不符直接拒绝且**不留任何记录**（无异议行、无审计、无通知）；非参与方
+  与不存在编号沿用统一 403 拒绝语义，不区分资料是否存在。
+- 受理异议的同一写事务内先按现有规则做确定性结算（到点开封→到期清除）：
+  若“两票已齐且最早开封时刻已到”，资料按现有规则先开封，异议随即被拒绝
+  （不产生异议行；开封若由本临界区触发则先提交再返回 409）；资料已清除或
+  已开封的异议同样 409 拒绝。受理时把进行中的开封请求置 invalidated 并删除
+  其全部旧同意（旧同意永久失效），并在异议未决期间阻止新的开封申请（创建
+  开封请求 409）。异议不阻止到期清除、见证人替换（异议人本人除外）与封存
+  人交接。
+- 异议人可在终结前撤回（withdrawn）；其余**两名当前见证人**可各凭原封存
+  摘要驳回一次：重复、摘要不符均 409 拒绝且不计票，非当前人员（含异议人
+  本人、被替换掉的旧见证人、非参与方）一律 403 统一拒绝；两名不同见证人
+  两票齐（UNIQUE(objection_id, witness_id) 兜底）异议才终结为 dismissed，
+  解除对开封的拦截，封存人可重新申请开封。
+- 未决期间**不得替换异议人**（替换 409）；替换其他见证人时，被替换旧人
+  已投的驳回票立即失效（驳回行删除），新见证人进入可驳回名单，异议仍
+  pending；封存人交接后异议继续存在并约束新封存人（旧同意此前已失效，
+  新封存人的新开封申请同样被拦截）。
+- 到期清除照常执行，不受异议影响：清除结算把未决异议置为 archived，
+  驳回票保留，归档后异议不可再撤回/驳回（409），也不能再提出新异议
+  （资料已清除）。
+- 异议受理与终结（撤回/两票驳回/清除归档）均在对应状态变更的同一写事务内
+  追加审计并向**当时参与方**（封存人 + 三名当前见证人，固定于事务时刻）
+  各投递一条站内通知（objection_filed / objection_withdrawn /
+  objection_dismissed / objection_archived）；查询异议绝不返回正文，也不
+  回显提交的所见摘要（异议表本身不保存资料正文）。并发异议、开封与见证
+  变更全部在 BEGIN IMMEDIATE 写锁内按结算后的状态裁定。
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 - 站内通知：资料开封（opened）或到期清除（purged）时，在状态变更的同一写
   事务内向“当时封存人 + 三名见证人”各记一条；见证人替换（witness_replaced）
@@ -134,6 +165,8 @@ from .schemas import (
     ApproveIn,
     AuditSnapshotIn,
     HandoverIn,
+    ObjectionDismissIn,
+    ObjectionIn,
     OpenRequestIn,
     PreSealConfirmIn,
     PreSealIn,
@@ -453,6 +486,36 @@ def purge_document_now(
         detail="资料已到清除时刻，待确认的封存人交接邀请失效",
     )
 
+    # 未决异议随清除归档：到期清除照常执行，不受异议拦截；归档后异议
+    # 不可再撤回/驳回（驳回票保留）。每条异议各留一条审计与一条通知。
+    pending_objections = tx.execute(
+        "SELECT id FROM objections WHERE document_id = ? AND status = 'pending'",
+        (doc_id,),
+    ).fetchall()
+    for orow in pending_objections:
+        tx.execute(
+            "UPDATE objections SET status='archived', resolved_at=? WHERE id=?",
+            (purge_at, orow["id"]),
+        )
+        event_seq = add_audit(
+            tx,
+            actor_id=None,
+            action="objection_archived",
+            document_id=doc_id,
+            detail=f"异议 {orow['id']} 在资料到清除时刻时未决，随清除归档；归档后不可再操作",
+        )
+        owner_id = tx.execute(
+            "SELECT owner_id FROM documents WHERE id = ?", (doc_id,)
+        ).fetchone()["owner_id"]
+        fanout_notifications(
+            tx,
+            recipients=participant_ids(tx, doc_id, owner_id),
+            document_id=doc_id,
+            event_seq=event_seq,
+            event_type="objection_archived",
+            at=purge_at,
+        )
+
     # 清空正文、置 purged；purged_at 记为约定的清除时刻，与扫描及时性无关。
     # 摘要、参与方（封存人/见证人）与审计元数据全部保留。
     tx.execute(
@@ -706,7 +769,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.11.0",
+    version="1.12.0",
     lifespan=lifespan,
 )
 
@@ -1611,6 +1674,18 @@ def get_document(
     else:
         # 开封前：只给当前开封请求的元数据，不给正文，也不给谁已同意
         result["purge_at"] = doc["purge_at"]    # 已安排的清除时刻（可能为 null）
+        pending_objection = db.execute(
+            "SELECT id, status, created_at FROM objections"
+            " WHERE document_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+            (doc_id,),
+        ).fetchone()
+        if pending_objection is not None:
+            # 未决异议摘要：只有编号/状态/时刻，不含异议理由与所见摘要
+            result["pending_objection"] = {
+                "objection_id": pending_objection["id"],
+                "status": pending_objection["status"],
+                "created_at": pending_objection["created_at"],
+            }
         if latest is not None:
             result["latest_open_request"] = {
                 "request_id": latest["id"],
@@ -1663,6 +1738,12 @@ def create_open_request(
             post_commit_error = err(409, "资料已清除，不能提交开封请求")
         elif doc["status"] != "sealed":
             raise err(409, "资料已开封，重复开封被拒绝")
+        elif tx.execute(
+            "SELECT 1 FROM objections WHERE document_id = ? AND status = 'pending'",
+            (doc_id,),
+        ).fetchone() is not None:
+            # 异议未决期间阻止新开封申请（受理异议时进行中的旧请求已失效）
+            raise err(409, "该资料存在未决异议，异议终结前不能提交开封请求")
         active = None if post_commit_error else tx.execute(
             "SELECT id, deadline FROM open_requests"
             " WHERE document_id = ? AND status IN ('pending', 'waiting')",
@@ -1923,6 +2004,417 @@ def revoke_open_request(
 
 
 # ---------------------------------------------------------------------------
+# 见证人异议（witness objection）
+#
+# 当前指定见证人在开封前对“所见摘要”或本人参与记录存疑时，凭资料编号 +
+# 所见摘要（必须等于封存摘要，不符拒绝且不留任何记录）+ 非空理由提出异议。
+# 同一资料同时至多一件未决异议（部分唯一索引 + 事务内预检）。
+#
+# 受理异议的同一写临界区内先按现有规则做确定性结算：
+#   1) 到点开封（resolve_due_waiting）-> 到期清除（purge_due_documents）；
+#   2) “两票已齐且最早开封时刻已到”的 waiting 请求先开封 -> 异议 409 被拒，
+#      不产生异议行（开封若在本临界区触发，必须先提交再报错）；
+#   3) 资料已 opened/purged -> 409 被拒，不留异议记录；
+#   4) 摘要不符 -> 409 拒绝且不留记录（无异议行/无审计/无通知）；
+#   5) 受理：进行中的开封请求置 invalidated、旧同意全部删除（永久失效），
+#      异议置 pending，封存人在异议终结前不能提交新的开封请求。
+# 异议人可撤回；其余两名当前见证人各凭原摘要驳回一次（重复/摘要不符 409
+# 不计票，异议人本人与非当前人员 403），两票齐异议 dismissed、解除拦截。
+# 未决期间不得替换异议人；替换其他见证人时旧人的驳回票失效；交接后异议
+# 继续约束新封存人。到期清除照常执行：未决异议随清除 archived，之后不可
+# 再操作。异议受理与终结均在状态变更同事务内留审计、向当时参与方投递
+# 通知；查询异议不返回正文、不回显所见摘要。
+# ---------------------------------------------------------------------------
+
+
+def serialize_objection(tx: sqlite3.Connection, obj: sqlite3.Row) -> dict[str, Any]:
+    """组装异议视图：只含编号、状态、理由、时刻与驳回票数；不含正文与摘要。
+
+    绝不回显 objector 提交的“所见摘要”（seen_digest），避免把服务端保存的
+    封存摘要通过异议接口泄露；异议表本身也不保存资料正文。
+    """
+    objector = tx.execute(
+        "SELECT username FROM users WHERE id = ?", (obj["objector_id"],)
+    ).fetchone()["username"]
+    dismissal_count = tx.execute(
+        "SELECT COUNT(*) AS c FROM objection_dismissals WHERE objection_id = ?",
+        (obj["id"],),
+    ).fetchone()["c"]
+    return {
+        "objection_id": obj["id"],
+        "document_id": obj["document_id"],
+        "objector": objector,
+        "status": obj["status"],
+        "reason": obj["reason"],
+        "dismissal_count": dismissal_count,
+        "required_dismissals": 2,
+        "created_at": obj["created_at"],
+        "resolved_at": obj["resolved_at"],
+    }
+
+
+@app.post("/documents/{doc_id}/objections", status_code=201)
+def create_objection(
+    doc_id: int,
+    payload: ObjectionIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """当前指定见证人在开封前提出异议。
+
+    非参与方与不存在编号统一 403（不区分资料是否存在）；封存人/非见证人
+    无权提出。摘要不符、资料已开封/已清除、已有未决异议一律 409；其中
+    “摘要不符”不留任何记录，“到点开封/清除导致的拒绝”让结算先提交落库。
+    """
+    doc = load_doc_for_participant(db, doc_id, user)
+    is_witness = db.execute(
+        "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+        (doc_id, user["id"]),
+    ).fetchone()
+    if is_witness is None:
+        raise err(403, "只有当前指定见证人可以提出异议")
+
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    try:
+        with authed_write_tx(db, user) as tx:
+            # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
+            # 两票已齐且最早开封时刻已到的请求在此先开封 -> 异议随后被拒；
+            # 到清除时刻的资料在此先清除 -> 异议随后被拒。
+            due_opened = resolve_due_waiting(tx, now) > 0
+            purged_here = purge_due_documents(tx, now, doc_id) > 0
+
+            doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+            # 锁内以当前名单复核（防止锁外等待期间被替换的旧见证人提出异议）
+            is_current_witness = tx.execute(
+                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+                (doc_id, user["id"]),
+            ).fetchone()
+            if is_current_witness is None:
+                raise err(403, "只有当前指定见证人可以提出异议")
+
+            if doc["status"] != "sealed":
+                # 开封/清除若由本临界区的确定性结算触发，必须先随事务提交，
+                # 错误延迟到提交后再抛出（与同意/撤销/替换路径同一语义）。
+                if doc["status"] == "purged":
+                    rejected = err(409, "资料已清除，异议被拒绝")
+                else:
+                    rejected = err(409, "资料已开封，异议被拒绝")
+                if due_opened or purged_here:
+                    post_commit_error = rejected
+                else:
+                    raise rejected
+            elif payload.digest != doc["digest"]:
+                # 摘要不符：拒绝且不留任何记录（无异议行、无审计、无通知）。
+                raise err(409, "提交的摘要与封存时摘要不一致，异议被拒绝")
+            elif tx.execute(
+                "SELECT 1 FROM objections WHERE document_id = ? AND status = 'pending'",
+                (doc_id,),
+            ).fetchone() is not None:
+                # 同一资料同时至多一件未决异议
+                raise err(409, "该资料已有未决异议，须先终结再提出")
+            else:
+                cur = tx.execute(
+                    "INSERT INTO objections"
+                    " (document_id, objector_id, seen_digest, reason, status, created_at)"
+                    " VALUES (?, ?, ?, ?, 'pending', ?)",
+                    (doc_id, user["id"], payload.digest, payload.reason, now),
+                )
+                objection_id = cur.lastrowid
+
+                # 受理异议：进行中（pending/waiting）的开封请求失效，
+                # 其全部旧同意删除（永久失效，不能用于后续请求）。
+                active = tx.execute(
+                    "SELECT * FROM open_requests"
+                    " WHERE document_id = ? AND status IN ('pending', 'waiting')"
+                    " ORDER BY id DESC LIMIT 1",
+                    (doc_id,),
+                ).fetchone()
+                if active is not None:
+                    tx.execute(
+                        "UPDATE open_requests SET status='invalidated', resolved_at=?"
+                        " WHERE id=?",
+                        (now, active["id"]),
+                    )
+                    add_audit(
+                        tx,
+                        actor_id=user["id"],
+                        action="request_invalidated",
+                        document_id=doc_id,
+                        request_id=active["id"],
+                        detail="见证人异议已受理：进行中的开封请求失效，其全部旧同意作废，须待异议终结后重新申请",
+                    )
+                    tx.execute(
+                        "DELETE FROM approvals WHERE request_id = ?", (active["id"],)
+                    )
+
+                event_seq = add_audit(
+                    tx,
+                    actor_id=user["id"],
+                    action="objection_filed",
+                    document_id=doc_id,
+                    detail=(
+                        f"见证人提出异议 {objection_id}，理由: {payload.reason}；"
+                        "进行中的开封请求与旧同意已失效，异议终结前阻止新的开封申请"
+                    ),
+                )
+                # 受理通知在同一事务内按“当时参与方”固定：封存人 + 三名当前见证人
+                fanout_notifications(
+                    tx,
+                    recipients=participant_ids(tx, doc_id, doc["owner_id"]),
+                    document_id=doc_id,
+                    event_seq=event_seq,
+                    event_type="objection_filed",
+                    at=now,
+                )
+                obj = tx.execute(
+                    "SELECT * FROM objections WHERE id = ?", (objection_id,)
+                ).fetchone()
+                result = serialize_objection(tx, obj)
+        if post_commit_error is not None:
+            raise post_commit_error
+        assert result is not None
+        return result
+    except sqlite3.IntegrityError:
+        # 部分唯一索引兜底（并发异议）：同一资料至多一件未决异议
+        raise err(409, "该资料已有未决异议，须先终结再提出")
+
+
+@app.post("/objections/{objection_id}/withdraw")
+def withdraw_objection(
+    objection_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """异议人在终结前撤回异议；撤回后开封拦截解除。
+
+    非异议人/非参与方/不存在编号统一 403；已撤回/已驳回/已归档 409。
+    清除若在本临界区生效，异议先归档提交，撤回失败在提交后返回。
+    """
+    obj = db.execute(
+        "SELECT * FROM objections WHERE id = ?", (objection_id,)
+    ).fetchone()
+    if obj is None:
+        raise err(403, "无权操作该异议或异议不存在")
+    if obj["objector_id"] != user["id"]:
+        raise err(403, "无权操作该异议或异议不存在")
+
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with authed_write_tx(db, user) as tx:
+        purged_here = purge_due_documents(tx, now, obj["document_id"]) > 0
+
+        obj = tx.execute(
+            "SELECT * FROM objections WHERE id = ?", (objection_id,)
+        ).fetchone()
+        if obj["objector_id"] != user["id"]:
+            raise err(403, "只有异议人本人可以撤回异议")
+        if obj["status"] == "archived" or purged_here:
+            # 清除可能刚在本临界区生效（异议已先归档）：必须先提交再报错
+            post_commit_error = err(409, "异议已随资料清除归档，不能撤回")
+        elif obj["status"] == "withdrawn":
+            raise err(409, "异议已撤回")
+        elif obj["status"] == "dismissed":
+            raise err(409, "异议已被两票驳回终结，不能撤回")
+        else:
+            tx.execute(
+                "UPDATE objections SET status='withdrawn', resolved_at=?"
+                " WHERE id=? AND status='pending'",
+                (now, objection_id),
+            )
+            event_seq = add_audit(
+                tx,
+                actor_id=user["id"],
+                action="objection_withdrawn",
+                document_id=obj["document_id"],
+                detail=f"异议人撤回异议 {objection_id}，对开封申请的拦截解除，封存人可重新申请开封",
+            )
+            doc = tx.execute(
+                "SELECT * FROM documents WHERE id = ?", (obj["document_id"],)
+            ).fetchone()
+            fanout_notifications(
+                tx,
+                recipients=participant_ids(tx, doc["id"], doc["owner_id"]),
+                document_id=doc["id"],
+                event_seq=event_seq,
+                event_type="objection_withdrawn",
+                at=now,
+            )
+            obj = tx.execute(
+                "SELECT * FROM objections WHERE id = ?", (objection_id,)
+            ).fetchone()
+            result = serialize_objection(tx, obj)
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+@app.post("/objections/{objection_id}/dismissals")
+def dismiss_objection(
+    objection_id: int,
+    payload: ObjectionDismissIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """异议人之外的当前见证人凭原封存摘要驳回异议；两票齐才解除拦截。
+
+    重复驳回、摘要不符一律 409 且不计票；异议人本人、被替换掉的旧见证人、
+    非参与方与不存在编号统一 403，不区分异议是否存在。
+    """
+    obj = db.execute(
+        "SELECT * FROM objections WHERE id = ?", (objection_id,)
+    ).fetchone()
+    if obj is None:
+        raise err(403, "无权操作该异议或异议不存在")
+    pre_witness = db.execute(
+        "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+        (obj["document_id"], user["id"]),
+    ).fetchone()
+    if pre_witness is None or obj["objector_id"] == user["id"]:
+        # 非当前见证人（含被替换的旧见证人）与异议人本人一律统一 403
+        raise err(403, "只有异议人之外的当前见证人可以驳回异议")
+
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    try:
+        with authed_write_tx(db, user) as tx:
+            # 到期清除照常执行：未决异议在清除结算中归档，随后驳回被拒。
+            purged_here = purge_due_documents(tx, now, obj["document_id"]) > 0
+
+            obj = tx.execute(
+                "SELECT * FROM objections WHERE id = ?", (objection_id,)
+            ).fetchone()
+            doc = tx.execute(
+                "SELECT * FROM documents WHERE id = ?", (obj["document_id"],)
+            ).fetchone()
+            # 锁内以当前名单复核：等待写锁期间被替换的旧见证人不得驳回
+            is_current_witness = tx.execute(
+                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+                (doc["id"], user["id"]),
+            ).fetchone()
+            if is_current_witness is None or obj["objector_id"] == user["id"]:
+                raise err(403, "只有异议人之外的当前见证人可以驳回异议")
+
+            if obj["status"] == "archived" or purged_here:
+                post_commit_error = err(409, "异议已随资料清除归档，不能驳回")
+            elif obj["status"] == "withdrawn":
+                raise err(409, "异议已被撤回，不能驳回")
+            elif obj["status"] == "dismissed":
+                raise err(409, "异议已被两票驳回终结")
+            elif payload.digest != doc["digest"]:
+                # 摘要不符：拒绝且不计票
+                raise err(409, "提交的摘要与封存时摘要不一致，驳回被拒绝")
+            elif tx.execute(
+                "SELECT 1 FROM objection_dismissals WHERE objection_id = ? AND witness_id = ?",
+                (objection_id, user["id"]),
+            ).fetchone() is not None:
+                # 同一见证人重复驳回：拒绝且不重复计票
+                raise err(409, "你已驳回本异议，重复提交只计一次")
+            else:
+                tx.execute(
+                    "INSERT INTO objection_dismissals"
+                    " (objection_id, witness_id, bound_digest, created_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (objection_id, user["id"], doc["digest"], now),
+                )
+                add_audit(
+                    tx,
+                    actor_id=user["id"],
+                    action="objection_dismissal",
+                    document_id=doc["id"],
+                    detail="当前见证人凭封存摘要驳回异议，已绑定封存摘要",
+                )
+                count = tx.execute(
+                    "SELECT COUNT(*) AS c FROM objection_dismissals"
+                    " WHERE objection_id = ?",
+                    (objection_id,),
+                ).fetchone()["c"]
+
+                new_status = "pending"
+                if count >= 2:
+                    # 第二名不同见证人到位（UNIQUE(objection_id, witness_id)
+                    # 保证两票必然来自不同见证人）：异议终结，拦截解除。
+                    tx.execute(
+                        "UPDATE objections SET status='dismissed', resolved_at=?"
+                        " WHERE id=? AND status='pending'",
+                        (now, objection_id),
+                    )
+                    event_seq = add_audit(
+                        tx,
+                        actor_id=user["id"],
+                        action="objection_dismissed",
+                        document_id=doc["id"],
+                        detail="两名其他当前见证人均已凭原摘要驳回，异议终结，对开封申请的拦截解除",
+                    )
+                    fanout_notifications(
+                        tx,
+                        recipients=participant_ids(tx, doc["id"], doc["owner_id"]),
+                        document_id=doc["id"],
+                        event_seq=event_seq,
+                        event_type="objection_dismissed",
+                        at=now,
+                    )
+                    new_status = "dismissed"
+
+                obj = tx.execute(
+                    "SELECT * FROM objections WHERE id = ?", (objection_id,)
+                ).fetchone()
+                result = {
+                    **serialize_objection(tx, obj),
+                    "new_status": new_status,
+                }
+        if post_commit_error is not None:
+            raise post_commit_error
+        assert result is not None
+        return result
+    except sqlite3.IntegrityError:
+        # UNIQUE(objection_id, witness_id) 兜底（并发重复驳回）：只计一次
+        raise err(409, "你已驳回本异议，重复提交只计一次")
+
+
+@app.get("/objections/{objection_id}")
+def get_objection(
+    objection_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """查询异议：仅资料当前参与方（封存人/当前见证人）或异议人本人可见。
+
+    先做读路径确定性清除（未决异议随清除归档），再返回最新状态。
+    响应不含正文，也不回显提交的所见摘要；非参与方与不存在编号统一 403。
+    """
+    obj = db.execute(
+        "SELECT * FROM objections WHERE id = ?", (objection_id,)
+    ).fetchone()
+    if obj is None:
+        raise err(403, "无权访问该异议或异议不存在")
+    settle_due_purges_for_read(db, obj["document_id"], user)
+    obj = db.execute(
+        "SELECT * FROM objections WHERE id = ?", (objection_id,)
+    ).fetchone()
+    doc = db.execute(
+        "SELECT * FROM documents WHERE id = ?", (obj["document_id"],)
+    ).fetchone()
+    is_party = (
+        doc is not None
+        and (
+            doc["owner_id"] == user["id"]
+            or db.execute(
+                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+                (doc["id"], user["id"]),
+            ).fetchone() is not None
+        )
+    )
+    if not is_party and obj["objector_id"] != user["id"]:
+        raise err(403, "无权访问该异议或异议不存在")
+    return serialize_objection(db, obj)
+
+
+# ---------------------------------------------------------------------------
 # 见证人替换（资料未开封）
 #
 # 封存人可在资料未开封时把一名指定见证人换成新见证人。新见证人必须已注册、
@@ -1997,6 +2489,19 @@ def replace_witness(
             ).fetchone()
             if pending_assignee is not None:
                 raise err(409, "该账号是待确认交接邀请的受让人，不能同时成为见证人")
+            # 未决异议期间不得替换异议人（异议人必须留到异议终结）
+            pending_objection = tx.execute(
+                "SELECT id FROM objections WHERE document_id = ? AND status = 'pending'"
+                " ORDER BY id DESC LIMIT 1",
+                (doc_id,),
+            ).fetchone()
+            if pending_objection is not None:
+                objector_id = tx.execute(
+                    "SELECT objector_id FROM objections WHERE id = ?",
+                    (pending_objection["id"],),
+                ).fetchone()["objector_id"]
+                if old_row["user_id"] == objector_id:
+                    raise err(409, "该见证人是未决异议的异议人，异议终结前不能被替换")
 
             # 进行中的开封请求（pending/waiting）。已过截止时刻的 pending
             # 请求按原规则在同一临界区内先确定性失效，再完成替换。
@@ -2033,6 +2538,24 @@ def replace_witness(
                 f"封存人替换见证人：{payload.old_witness} -> {payload.new_witness}",
                 "新见证人已注册且不在原名单，替换后仍为三名互不相同见证人",
             ]
+
+            # 被替换者若对未决异议投过驳回票，其驳回票立即失效（行删除）：
+            # 交接后异议继续，新见证人可凭原摘要驳回一次。
+            if pending_objection is not None:
+                removed_votes = tx.execute(
+                    "DELETE FROM objection_dismissals"
+                    " WHERE objection_id = ? AND witness_id = ?",
+                    (pending_objection["id"], old_row["user_id"]),
+                ).rowcount
+                if removed_votes:
+                    details.append(
+                        f"被替换者 {payload.old_witness} 对异议 {pending_objection['id']}"
+                        " 的驳回票已失效，异议继续约束新封存人"
+                    )
+                else:
+                    details.append(
+                        f"异议 {pending_objection['id']} 未决，替换其他见证人不影响异议"
+                    )
 
             req_info: dict[str, Any] | None = None
             if expired_id is not None:

@@ -123,7 +123,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     document_id  INTEGER NOT NULL REFERENCES documents(id),
     event_seq    INTEGER NOT NULL,
     event_type   TEXT NOT NULL CHECK (event_type IN
-                     ('opened', 'purged', 'witness_replaced', 'handover_confirmed')),
+                     ('opened', 'purged', 'witness_replaced', 'handover_confirmed',
+                      'objection_filed', 'objection_withdrawn',
+                      'objection_dismissed', 'objection_archived')),
     at           TEXT NOT NULL,            -- 事件时刻（开封/清除时刻等，UTC 字符串）
     is_read      INTEGER NOT NULL DEFAULT 0,
     read_at      TEXT,                     -- 首次标记已读时刻；重试保留，不产生额外记录
@@ -182,6 +184,43 @@ CREATE TABLE IF NOT EXISTS pre_seal_confirmations (
     UNIQUE(proposal_id, witness_id)             -- 同一见证人对同一提案至多确认一次
 );
 CREATE INDEX IF NOT EXISTS idx_pre_seal_confirmations_proposal ON pre_seal_confirmations(proposal_id);
+
+-- 见证人异议：当前指定见证人在开封前对“所见摘要”或本人参与记录存疑时，
+-- 凭资料编号 + 所见摘要（须等于封存摘要，不符拒绝且不留任何记录）+ 非空
+-- 理由提出，取得异议编号与 pending 状态。每份资料同时至多一件未决异议
+-- （部分唯一索引兜底并发）。受理异议的同一事务内：进行中的开封请求失效、
+-- 旧同意删除，并阻止新的开封申请；若两票已齐且最早开封时刻已到，到点开封
+-- 规则先生效，异议被拒绝（不产生异议行）。
+--   pending    未决：异议人可撤回；其余两名当前见证人可各凭原摘要驳回一次，
+--              两票齐 -> dismissed（解除拦截，封存人可重新申请开封）；
+--   withdrawn  异议人撤回；
+--   dismissed  两名其他当前见证人驳回齐票，异议终结；
+--   archived   资料到期清除时未决异议随清除归档，归档后不可再操作。
+-- 未决期间不得替换异议人；替换其他见证人时旧人在 objection_dismissals 中
+-- 的驳回票失效（行删除），交接后异议继续约束新封存人。
+CREATE TABLE IF NOT EXISTS objections (
+    id           INTEGER PRIMARY KEY,
+    document_id  INTEGER NOT NULL REFERENCES documents(id),
+    objector_id  INTEGER NOT NULL REFERENCES users(id),   -- 提出异议时的当前见证人
+    seen_digest  TEXT NOT NULL,            -- 异议人提交的“所见摘要”（任何接口都不回显）
+    reason       TEXT NOT NULL,            -- 非空理由
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'withdrawn', 'dismissed', 'archived')),
+    created_at   TEXT NOT NULL,
+    resolved_at  TEXT                      -- 撤回/驳回终结/归档时刻
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_objections_one_pending
+    ON objections(document_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_objections_document ON objections(document_id);
+
+CREATE TABLE IF NOT EXISTS objection_dismissals (
+    id           INTEGER PRIMARY KEY,
+    objection_id INTEGER NOT NULL REFERENCES objections(id) ON DELETE CASCADE,
+    witness_id   INTEGER NOT NULL REFERENCES users(id),   -- 驳回人：异议人之外的当前见证人
+    bound_digest TEXT NOT NULL,            -- 驳回时提交并比对的封存摘要
+    created_at   TEXT NOT NULL,
+    UNIQUE(objection_id, witness_id)       -- 同一见证人对同一异议至多驳回一次
+);
+CREATE INDEX IF NOT EXISTS idx_objection_dismissals_objection ON objection_dismissals(objection_id);
 """
 
 
@@ -240,6 +279,33 @@ ALTER TABLE documents_new RENAME TO documents;
 """
 
 
+# 旧库迁移（幂等）：notifications 的 CHECK 约束不含异议事件时重建表
+_MIGRATION_REBUILD_NOTIFICATIONS = """
+CREATE TABLE notifications_new (
+    id           INTEGER PRIMARY KEY,
+    recipient_id INTEGER NOT NULL REFERENCES users(id),
+    document_id  INTEGER NOT NULL REFERENCES documents(id),
+    event_seq    INTEGER NOT NULL,
+    event_type   TEXT NOT NULL CHECK (event_type IN
+                     ('opened', 'purged', 'witness_replaced', 'handover_confirmed',
+                      'objection_filed', 'objection_withdrawn',
+                      'objection_dismissed', 'objection_archived')),
+    at           TEXT NOT NULL,
+    is_read      INTEGER NOT NULL DEFAULT 0,
+    read_at      TEXT,
+    created_at   TEXT NOT NULL
+);
+INSERT INTO notifications_new (id, recipient_id, document_id, event_seq, event_type, at, is_read, read_at, created_at)
+SELECT id, recipient_id, document_id, event_seq, event_type, at, is_read, read_at, created_at FROM notifications;
+DROP TABLE notifications;
+ALTER TABLE notifications_new RENAME TO notifications;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_recipient_event
+    ON notifications(recipient_id, event_seq);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_seq
+    ON notifications(recipient_id, event_seq, id);
+"""
+
+
 def init_db(db_path: str | None = None) -> None:
     """幂等初始化：创建库表并开启 WAL / 外键（容器初始化时与应用启动时各调用一次也安全）。"""
     conn = connect(db_path)
@@ -281,6 +347,15 @@ def init_db(db_path: str | None = None) -> None:
             )
         if "deactivated_at" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN deactivated_at TEXT")
+        # notifications 迁移：CHECK 不含异议事件类型时重建表（异议/异议驳回/
+        # 撤回/归档通知写入会触发该约束，旧库必须先补齐）。
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='notifications'"
+        ).fetchone()
+        if sql is not None and "objection_filed" not in sql["sql"]:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript(_MIGRATION_REBUILD_NOTIFICATIONS)
+            conn.execute("PRAGMA foreign_keys=ON")
         conn.commit()
     finally:
         conn.close()

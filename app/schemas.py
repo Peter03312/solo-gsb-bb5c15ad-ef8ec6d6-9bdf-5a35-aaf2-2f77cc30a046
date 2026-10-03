@@ -116,6 +116,29 @@ class ViewPassRedeemIn(BaseModel):
     token: str = Field(min_length=1, max_length=256)
 
 
+class ObjectionIn(BaseModel):
+    """当前见证人在开封前对所见摘要/参与记录提出异议。
+
+    所见摘要须等于封存时摘要（不符拒绝且不留记录）；理由非空（纯空白拒绝）。
+    """
+
+    digest: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("异议理由不能为空")
+        return v
+
+
+class ObjectionDismissIn(BaseModel):
+    """其他当前见证人凭原封存摘要驳回异议；两票齐才解除拦截。"""
+
+    digest: str = Field(min_length=1, max_length=128)
+
+
 # ---------------------------------------------------------------------------
 # 审计快照离线验真
 #
