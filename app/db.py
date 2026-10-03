@@ -123,7 +123,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     document_id  INTEGER NOT NULL REFERENCES documents(id),
     event_seq    INTEGER NOT NULL,
     event_type   TEXT NOT NULL CHECK (event_type IN
-                     ('opened', 'purged', 'witness_replaced', 'handover_confirmed')),
+                     ('opened', 'purged', 'witness_replaced', 'handover_confirmed',
+                      'objection_filed', 'objection_withdrawn',
+                      'objection_dismissed', 'objection_archived')),
     at           TEXT NOT NULL,            -- 事件时刻（开封/清除时刻等，UTC 字符串）
     is_read      INTEGER NOT NULL DEFAULT 0,
     read_at      TEXT,                     -- 首次标记已读时刻；重试保留，不产生额外记录
@@ -182,6 +184,41 @@ CREATE TABLE IF NOT EXISTS pre_seal_confirmations (
     UNIQUE(proposal_id, witness_id)             -- 同一见证人对同一提案至多确认一次
 );
 CREATE INDEX IF NOT EXISTS idx_pre_seal_confirmations_proposal ON pre_seal_confirmations(proposal_id);
+
+-- 见证人异议：当前指定见证人在开封前可对“所见摘要/参与记录”提出异议。
+-- 提交资料编号、所见摘要与非空理由；摘要不符拒绝且不留任何记录。每份资料
+-- 同时至多一件未决（pending）异议（部分唯一索引兜底并发）。受理即把进行中
+-- 的开封请求置 invalidated/expired 并删除其全部旧同意，同时阻止新的开封申请；
+-- 异议人可撤回（withdrawn），其余两名当前见证人各凭原摘要驳回一次，两票齐
+-- 驳回（dismissed）才解除拦截；资料到期清除时未决异议归档（archived）且
+-- 不可再操作。异议受理与终结均追加审计并向当时参与方投递站内通知。
+CREATE TABLE IF NOT EXISTS objections (
+    id              INTEGER PRIMARY KEY,
+    document_id     INTEGER NOT NULL REFERENCES documents(id),
+    objector_id     INTEGER NOT NULL REFERENCES users(id),   -- 提出异议时的当前见证人
+    observed_digest TEXT NOT NULL,            -- 异议人提交并与封存摘要比对的所见摘要
+    reason          TEXT NOT NULL,            -- 非空理由
+    status          TEXT NOT NULL CHECK (status IN ('pending', 'withdrawn', 'dismissed', 'archived')),
+    created_at      TEXT NOT NULL,
+    resolved_at     TEXT                      -- 撤回/驳回/归档时刻
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_objections_one_pending
+    ON objections(document_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_objections_document ON objections(document_id);
+
+-- 异议驳回：异议受理后，其余两名当前见证人可各凭【封存摘要】驳回一次；
+-- 两票齐才解除拦截。重复、摘要不符或非当前人员的驳回一律拒绝且不计票
+-- （UNIQUE 兜底同一见证人对同一异议至多一票）。替换其他见证人时，旧人
+-- 已投的驳回票即时删除失效，交接/替换后异议继续约束新封存人/新见证人。
+CREATE TABLE IF NOT EXISTS objection_dismissals (
+    id           INTEGER PRIMARY KEY,
+    objection_id INTEGER NOT NULL REFERENCES objections(id) ON DELETE CASCADE,
+    witness_id   INTEGER NOT NULL REFERENCES users(id),
+    bound_digest TEXT NOT NULL,               -- 驳回时提交并比对的封存摘要
+    created_at   TEXT NOT NULL,
+    UNIQUE(objection_id, witness_id)
+);
+CREATE INDEX IF NOT EXISTS idx_objection_dismissals_objection ON objection_dismissals(objection_id);
 """
 
 
@@ -239,6 +276,35 @@ DROP TABLE documents;
 ALTER TABLE documents_new RENAME TO documents;
 """
 
+# 旧库迁移（幂等）：notifications 的事件类型 CHECK 增加见证人异议的四类事件
+# （objection_filed/withdrawn/dismissed/archived），不含时整表重建并搬移数据。
+_MIGRATION_REBUILD_NOTIFICATIONS = """
+CREATE TABLE notifications_new (
+    id           INTEGER PRIMARY KEY,
+    recipient_id INTEGER NOT NULL REFERENCES users(id),
+    document_id  INTEGER NOT NULL REFERENCES documents(id),
+    event_seq    INTEGER NOT NULL,
+    event_type   TEXT NOT NULL CHECK (event_type IN
+                     ('opened', 'purged', 'witness_replaced', 'handover_confirmed',
+                      'objection_filed', 'objection_withdrawn',
+                      'objection_dismissed', 'objection_archived')),
+    at           TEXT NOT NULL,
+    is_read      INTEGER NOT NULL DEFAULT 0,
+    read_at      TEXT,
+    created_at   TEXT NOT NULL
+);
+INSERT INTO notifications_new
+    (id, recipient_id, document_id, event_seq, event_type, at, is_read, read_at, created_at)
+SELECT id, recipient_id, document_id, event_seq, event_type, at, is_read, read_at, created_at
+FROM notifications;
+DROP TABLE notifications;
+ALTER TABLE notifications_new RENAME TO notifications;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_recipient_event
+    ON notifications(recipient_id, event_seq);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_seq
+    ON notifications(recipient_id, event_seq, id);
+"""
+
 
 def init_db(db_path: str | None = None) -> None:
     """幂等初始化：创建库表并开启 WAL / 外键（容器初始化时与应用启动时各调用一次也安全）。"""
@@ -281,6 +347,15 @@ def init_db(db_path: str | None = None) -> None:
             )
         if "deactivated_at" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN deactivated_at TEXT")
+        # notifications 迁移：事件类型 CHECK 增加见证人异议的四类事件；
+        # 旧约束不含异议事件时整表重建（数据原样搬移，索引重建）。
+        notif_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='notifications'"
+        ).fetchone()["sql"]
+        if "objection_filed" not in notif_sql:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript(_MIGRATION_REBUILD_NOTIFICATIONS)
+            conn.execute("PRAGMA foreign_keys=ON")
         conn.commit()
     finally:
         conn.close()

@@ -116,6 +116,19 @@ class ViewPassRedeemIn(BaseModel):
     token: str = Field(min_length=1, max_length=256)
 
 
+class ObjectionIn(BaseModel):
+    """当前见证人在开封前对所见摘要/参与记录提出异议。"""
+
+    observed_digest: str = Field(min_length=1, max_length=128)  # 所见摘要，须等于封存摘要
+    reason: str = Field(min_length=1, max_length=2000)          # 非空理由
+
+
+class ObjectionDismissIn(BaseModel):
+    """其余两名当前见证人各凭封存摘要驳回一次异议。"""
+
+    digest: str = Field(min_length=1, max_length=128)
+
+
 # ---------------------------------------------------------------------------
 # 审计快照离线验真
 #
